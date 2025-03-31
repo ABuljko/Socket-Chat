@@ -37,3 +37,5 @@ A socket-based chatroom application built with Python. It allows users to sign u
   - `socket`
   - `sqlite3`
   - `tkinter` (usually comes with Python)
+## Contributors
+Amin Niaziardekani, Swapnaneel Sarkhel, Ajdin Buljko
