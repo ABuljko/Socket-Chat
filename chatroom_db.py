@@ -31,8 +31,9 @@ CREATE INDEX IF NOT EXISTS requests_pair ON requests (sender, receiver);
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
 
-# Request updates read, then write, so run them one at a time.
-_request_lock = threading.Lock()
+# Run writes one at a time. Waiting on SQLite's own lock can time out when commits are slow.
+# Request updates also read, then write, so this keeps them consistent.
+_write_lock = threading.Lock()
 
 
 def connect():
@@ -69,9 +70,10 @@ def verify_password(password, stored):
 
 
 def add_user(username, password):
-    with connect() as conn, conn:
+    hashed = hash_password(password)
+    with _write_lock, connect() as conn, conn:
         try:
-            conn.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hash_password(password)))
+            conn.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed))
         except sqlite3.IntegrityError:
             return False
     return True
@@ -90,7 +92,7 @@ def user_exists(username):
 
 def add_request(sender, receiver):
     """Return 'sent', 'pending', 'friends', or 'accepted' if receiver had already asked sender."""
-    with _request_lock, connect() as conn, conn:
+    with _write_lock, connect() as conn, conn:
         rows = conn.execute(
             "SELECT sender, status FROM requests WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)",
             (sender, receiver, receiver, sender),
@@ -113,7 +115,7 @@ def add_request(sender, receiver):
 def respond_to_request(sender, receiver, accept):
     """Return False if there was no pending request."""
     status = "accepted" if accept else "rejected"
-    with _request_lock, connect() as conn, conn:
+    with _write_lock, connect() as conn, conn:
         cursor = conn.execute(
             "UPDATE requests SET status = ? WHERE sender = ? AND receiver = ? AND status = 'pending'",
             (status, sender, receiver),
@@ -145,7 +147,7 @@ def are_friends(user1, user2):
 
 def add_message(sender, receiver, message):
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
-    with connect() as conn, conn:
+    with _write_lock, connect() as conn, conn:
         conn.execute(
             "INSERT INTO messages (sender, receiver, message, timestamp) VALUES (?, ?, ?, ?)",
             (sender, receiver, message, timestamp),

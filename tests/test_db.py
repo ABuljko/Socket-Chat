@@ -1,4 +1,7 @@
 import re
+import sqlite3
+import threading
+from contextlib import closing
 
 import chatroom_db as db
 
@@ -75,6 +78,29 @@ def test_chat_history_keeps_order_and_content(db_path):
     history = db.get_chat_history("bob", "alice")
     assert [row[2] for row in history] == texts
     assert history[0][:2] == ("alice", "bob")
+
+
+def test_concurrent_writes_do_not_wait_on_sqlite(db_path, monkeypatch):
+    # No busy timeout, so any wait on SQLite's lock fails. Slow CI disks made the real timeout run out.
+    monkeypatch.setattr(db, "connect", lambda: closing(sqlite3.connect(db_path, timeout=0)))
+    errors = []
+
+    def work(i):
+        try:
+            for n in range(25):
+                db.add_message(f"u{i}", f"v{i}", "x" * 1900)
+                db.add_request(f"u{i}", f"w{n}")
+        except sqlite3.OperationalError as e:
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert len(db.get_chat_history("u0", "v0")) == 25
+    assert db.get_requests("w0") == [f"u{i}" for i in range(8)]
 
 
 def test_init_db_is_idempotent_and_reset_clears(db_path):
