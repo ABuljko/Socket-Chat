@@ -5,12 +5,18 @@ import json
 import queue
 import re
 import socket
+import ssl
+import sys
 import threading
+from pathlib import Path
 
 import chatroom_db as db
+import tls
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5557
+DEFAULT_CERT = Path(__file__).with_name("cert.pem")
+DEFAULT_KEY = Path(__file__).with_name("key.pem")
 MAX_LINE = 64 * 1024
 MAX_QUEUED = 1000
 MAX_MESSAGE = 2000
@@ -34,7 +40,7 @@ class Connection:
 
     def __init__(self, sock):
         self.sock = sock
-        self.reader = sock.makefile("r", encoding="utf-8", errors="replace", newline="\n")
+        self.reader = sock.makefile()
         self.outbox = queue.Queue(MAX_QUEUED)
         self.writer = threading.Thread(target=self._write_loop, daemon=True)
         self.writer.start()
@@ -83,10 +89,7 @@ class Connection:
 
     def shutdown(self):
         # Wakes the reading thread, which then closes the connection.
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        self.sock.shutdown()
 
     def close(self):
         self.finish()
@@ -234,8 +237,15 @@ USER_HANDLERS = {
 }
 
 
-def handle_client(sock, addr):
-    conn = Connection(sock)
+def handle_client(sock, addr, context):
+    try:
+        sock.settimeout(tls.HANDSHAKE_TIMEOUT)
+        sock = context.wrap_socket(sock, server_side=True)
+    except OSError as e:
+        print(f"TLS handshake with {addr} failed: {e}")
+        sock.close()
+        return
+    conn = Connection(tls.LockedSocket(sock))
     try:
         while (message := conn.receive()) is not None:
             handlers = USER_HANDLERS if conn.username else GUEST_HANDLERS
@@ -264,14 +274,14 @@ def handle_client(sock, addr):
         print(f"Disconnected {addr}")
 
 
-def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT):
+def start_server(context, host=DEFAULT_HOST, port=DEFAULT_PORT):
     db.init_db()
     with socket.create_server((host, port)) as server:
-        print(f"Server listening on {host}:{port}")
+        print(f"Server listening on {host}:{port} (TLS)")
         while True:
             client_socket, addr = server.accept()
             print(f"Connection from {addr}")
-            threading.Thread(target=handle_client, args=(client_socket, addr), daemon=True).start()
+            threading.Thread(target=handle_client, args=(client_socket, addr, context), daemon=True).start()
 
 
 def main():
@@ -279,11 +289,20 @@ def main():
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--db", help="SQLite database file (default: chatroom.db next to this script)")
+    parser.add_argument("--cert", default=DEFAULT_CERT, help="TLS certificate (default: cert.pem next to this script)")
+    parser.add_argument("--key", default=DEFAULT_KEY, help="TLS private key (default: key.pem next to this script)")
     args = parser.parse_args()
     if args.db:
         db.DB_PATH = args.db
+    for path in (args.cert, args.key):
+        if not Path(path).is_file():
+            sys.exit(f"{path} not found. Run python make_cert.py to make a certificate.")
     try:
-        start_server(args.host, args.port)
+        context = tls.server_context(args.cert, args.key)
+    except ssl.SSLError as e:
+        sys.exit(f"Could not load the certificate: {e}")
+    try:
+        start_server(context, args.host, args.port)
     except KeyboardInterrupt:
         pass
 

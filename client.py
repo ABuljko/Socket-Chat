@@ -5,17 +5,22 @@ import socket
 import threading
 import traceback
 from datetime import UTC, datetime
+from pathlib import Path
 from tkinter import *
 from tkinter import messagebox
 
+import tls
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5557
+DEFAULT_CAFILE = Path(__file__).with_name("cert.pem")
 
 
 class ServerConnection:
-    def __init__(self, host, port, events):
-        self.sock = socket.create_connection((host, port), timeout=5)
-        self.sock.settimeout(None)
+    def __init__(self, host, port, cafile, events):
+        context = tls.client_context(cafile)
+        sock = socket.create_connection((host, port), timeout=5)
+        self.sock = tls.LockedSocket(context.wrap_socket(sock, server_hostname=host))
         self.events = events
         threading.Thread(target=self._read_loop, daemon=True).start()
 
@@ -24,7 +29,7 @@ class ServerConnection:
 
     def _read_loop(self):
         try:
-            with self.sock.makefile("r", encoding="utf-8", errors="replace", newline="\n") as reader:
+            with self.sock.makefile() as reader:
                 for line in reader:
                     try:
                         message = json.loads(line)
@@ -37,10 +42,6 @@ class ServerConnection:
         self.events.put((self, {"type": "disconnected"}))
 
     def close(self):
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
         self.sock.close()
 
 
@@ -59,8 +60,11 @@ def connect_to_server():
     if server:
         return True
     try:
-        server = ServerConnection(args.host, args.port, events)
+        server = ServerConnection(args.host, args.port, args.cafile, events)
         return True
+    except FileNotFoundError:
+        messagebox.showerror("Connection Error", f"Certificate {args.cafile} not found. Ask the server owner for it.")
+        return False
     except OSError as e:
         messagebox.showerror("Connection Error", f"Failed to connect to server: {e}")
         return False
@@ -442,6 +446,9 @@ def info():
 parser = argparse.ArgumentParser(description="Run the chat client.")
 parser.add_argument("--host", default=DEFAULT_HOST)
 parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+parser.add_argument(
+    "--cafile", default=DEFAULT_CAFILE, help="server certificate to trust (default: cert.pem next to this script)"
+)
 args = parser.parse_args()
 
 root = Tk()

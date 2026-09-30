@@ -8,8 +8,11 @@ from pathlib import Path
 import pytest
 
 import chatroom_db as db
+import make_cert
+import tls
 
 REPO = Path(__file__).resolve().parent.parent
+HOST = "127.0.0.1"
 
 
 @pytest.fixture
@@ -26,20 +29,30 @@ def free_port():
         return s.getsockname()[1]
 
 
+@pytest.fixture(scope="session")
+def cert(tmp_path_factory):
+    folder = tmp_path_factory.mktemp("cert")
+    cert, key = folder / "cert.pem", folder / "key.pem"
+    make_cert.make_cert(cert, key)
+    return cert, key
+
+
 @pytest.fixture
-def server(tmp_path):
+def server(tmp_path, cert):
     """Start server.py on a free port with its own database."""
     port = free_port()
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(REPO / "server.py"), "--port", str(port), "--db", str(tmp_path / "server.db")],
+        [sys.executable, "-u", str(REPO / "server.py"), "--port", str(port), "--db", str(tmp_path / "server.db")]
+        + ["--cert", str(cert[0]), "--key", str(cert[1])],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    context = tls.client_context(cert[0])
     deadline = time.monotonic() + 10
     while True:
         try:
-            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            Client(port, context).close()
             break
         except OSError:
             if time.monotonic() > deadline or proc.poll() is not None:
@@ -50,10 +63,12 @@ def server(tmp_path):
     clients = []
 
     def connect():
-        client = Client(port)
+        client = Client(port, context)
         clients.append(client)
         return client
 
+    connect.port = port
+    connect.context = context
     yield connect
     for client in clients:
         client.close()
@@ -63,8 +78,8 @@ def server(tmp_path):
 
 
 class Client:
-    def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port))
+    def __init__(self, port, context):
+        self.sock = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=5), server_hostname=HOST)
         self.buffer = b""
 
     def send(self, type_, /, **fields):
