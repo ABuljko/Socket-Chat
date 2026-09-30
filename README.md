@@ -1,41 +1,49 @@
 # Socket Chat
 
-A socket-based chatroom application built with Python. It allows users to sign up, log in, send messages, and manage friend requests in real-time. The chatroom supports multiple clients and enables seamless communication between users using a combination of **Tkinter** for the graphical user interface and **SQLite** for database management.
+[![CI](https://github.com/ABuljko/Socket-Chat/actions/workflows/ci.yml/badge.svg)](https://github.com/ABuljko/Socket-Chat/actions/workflows/ci.yml)
 
-## Features
-
-- **User Authentication:**
-  - Sign up and login functionality.
-  - User credentials stored securely in an SQLite database.
-
-- **Real-Time Messaging:**
-  - Users can send and receive messages in real-time using sockets.
-  - Multiple users can be connected simultaneously.
-
-- **Friend Request Management:**
-  - Send, accept, or reject friend requests.
-  - View friends list.
-
-- **Graphical User Interface (GUI):**
-  - Built with **Tkinter** for an intuitive and responsive chat interface.
-
----
-
-## Technologies Used
-
-- **Python** - Main programming language.
-- **SQLite** - Database management system for storing user data, messages, and friend requests.
-- **Tkinter** - GUI library for building the user interface.
-- **Sockets** - For real-time communication between clients and server.
-
----
+A simple chat app written in Python. Users sign up, add friends and send each other messages.
 
 ## Requirements
 
-- Python 3.x or above
-- Required Python libraries:
-  - `socket`
-  - `sqlite3`
-  - `tkinter` (usually comes with Python)
+- Python 3.12 or newer
+
+## How to run
+
+Start the server:
+
+```
+python server.py
+```
+
+Start the app (once for each user):
+
+```
+python main.py
+```
+
+## How to use
+
+1. **File > Sign up** to create an account.
+2. **Friends > Find User** to send a friend request.
+3. Your friend accepts it in **Friends > Pending Requests**.
+4. Click your friend's name on the left and start chatting.
+
+## Good to know
+
+- To start over with an empty database, run `python initialize_db.py`.
+- Messages are not encrypted. Use it only on a network you trust.
+
+## For developers
+
+Install [uv](https://docs.astral.sh/uv/), then run the checks:
+
+```
+uv sync
+uv run ruff check .
+uv run pytest
+```
+
 ## Contributors
+
 Amin Niaziardekani, Swapnaneel Sarkhel, Ajdin Buljko
