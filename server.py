@@ -29,11 +29,17 @@ LOGIN_FREE_FAILURES = 5
 LOGIN_MAX_WAIT = 60
 LOGIN_FORGET = 15 * 60
 LOGIN_MAX_TRACKED = 10_000
+PING_INTERVAL = 20
+IDLE_TIMEOUT = 60
+# Clients reconnect after this long without hearing from us (SERVER_TIMEOUT in chat_client/app.py).
+CLIENT_TIMEOUT = 60
 
 log = logging.getLogger("server")
 
 clients = {}
 clients_lock = threading.Lock()
+connections = set()
+connections_lock = threading.Lock()
 
 
 class ProtocolError(Exception):
@@ -55,6 +61,7 @@ class Connection:
         self.writer = threading.Thread(target=self._write_loop, daemon=True)
         self.writer.start()
         self.username = None
+        self.last_seen = time.monotonic()
 
     def send(self, type_, /, **fields):
         data = (json.dumps({"type": type_, **fields}) + "\n").encode()
@@ -83,6 +90,7 @@ class Connection:
             line = self.reader.readline(MAX_LINE)
             if not line:
                 return None
+            self.last_seen = time.monotonic()
             if not line.endswith("\n"):
                 if len(line) >= MAX_LINE:
                     raise ProtocolError("line too long")
@@ -291,9 +299,14 @@ def handle_message(conn, message):
         send_to(receiver, "message", **fields)
 
 
+def handle_pong(conn, message):
+    pass
+
+
 GUEST_HANDLERS = {
     "signup": handle_signup,
     "login": handle_login,
+    "pong": handle_pong,
 }
 
 USER_HANDLERS = {
@@ -302,6 +315,7 @@ USER_HANDLERS = {
     "pending": handle_pending,
     "history": handle_history,
     "message": handle_message,
+    "pong": handle_pong,
 }
 
 
@@ -314,6 +328,8 @@ def handle_client(sock, addr, context):
         sock.close()
         return
     conn = Connection(tls.LockedSocket(sock), addr[0])
+    with connections_lock:
+        connections.add(conn)
     try:
         while (message := conn.receive()) is not None:
             handlers = USER_HANDLERS if conn.username else GUEST_HANDLERS
@@ -334,6 +350,8 @@ def handle_client(sock, addr, context):
     except Exception:
         log.exception("Error handling %s", addr)
     finally:
+        with connections_lock:
+            connections.discard(conn)
         if conn.username:
             with clients_lock:
                 if clients.get(conn.username) is conn:
@@ -342,14 +360,40 @@ def handle_client(sock, addr, context):
         log.info("Disconnected %s", addr)
 
 
-def start_server(context, host=DEFAULT_HOST, port=DEFAULT_PORT):
+def heartbeat(interval=PING_INTERVAL, timeout=IDLE_TIMEOUT):
+    while True:
+        time.sleep(interval)
+        now = time.monotonic()
+        with connections_lock:
+            current = list(connections)
+        for conn in current:
+            try:
+                if now - conn.last_seen > timeout:
+                    log.info("Dropping %s: no reply to pings", conn.host)
+                    conn.shutdown()
+                else:
+                    conn.send("ping")
+            except Exception:
+                # One bad connection must not stop the pings for everyone.
+                log.exception("Heartbeat failed for %s", conn.host)
+
+
+def start_server(context, host=DEFAULT_HOST, port=DEFAULT_PORT, ping_interval=PING_INTERVAL, idle_timeout=IDLE_TIMEOUT):
     db.init_db()
+    threading.Thread(target=heartbeat, args=(ping_interval, idle_timeout), daemon=True).start()
     with socket.create_server((host, port)) as server:
         log.info("Server listening on %s:%s (TLS)", host, port)
         while True:
             client_socket, addr = server.accept()
             log.info("Connection from %s", addr)
             threading.Thread(target=handle_client, args=(client_socket, addr, context), daemon=True).start()
+
+
+def seconds(text):
+    value = float(text)
+    if not 0 < value < math.inf:
+        raise argparse.ArgumentTypeError(f"{text} is not a positive number of seconds")
+    return value
 
 
 def main():
@@ -359,7 +403,15 @@ def main():
     parser.add_argument("--db", help="SQLite database file (default: chatroom.db next to this script)")
     parser.add_argument("--cert", default=DEFAULT_CERT, help="TLS certificate (default: cert.pem next to this script)")
     parser.add_argument("--key", default=DEFAULT_KEY, help="TLS private key (default: key.pem next to this script)")
+    parser.add_argument("--ping-interval", type=seconds, default=PING_INTERVAL, help="seconds between pings")
+    parser.add_argument(
+        "--idle-timeout", type=seconds, default=IDLE_TIMEOUT, help="drop clients silent for this many seconds"
+    )
     args = parser.parse_args()
+    if args.idle_timeout <= args.ping_interval:
+        parser.error("--idle-timeout must be longer than --ping-interval")
+    if args.ping_interval >= CLIENT_TIMEOUT:
+        parser.error(f"--ping-interval must be under {CLIENT_TIMEOUT}, or clients will keep reconnecting")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.db:
         db.DB_PATH = args.db
@@ -371,7 +423,7 @@ def main():
     except ssl.SSLError as e:
         sys.exit(f"Could not load the certificate: {e}")
     try:
-        start_server(context, args.host, args.port)
+        start_server(context, args.host, args.port, args.ping_interval, args.idle_timeout)
     except KeyboardInterrupt:
         pass
 

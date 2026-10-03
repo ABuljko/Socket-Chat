@@ -1,6 +1,11 @@
+import argparse
 import json
+import subprocess
+import sys
+import time
 
 import pytest
+from conftest import REPO
 
 import server as chat_server
 
@@ -278,3 +283,63 @@ def test_throttle_prunes_stale_entries(throttle, clock, monkeypatch):
     fail(throttle, "2.2.2.2", "fresh")
     fail(throttle, "2.2.2.2", "fresh")
     assert set(throttle.failures) == {("ip", "2.2.2.2"), ("user", "fresh")}
+
+
+FAST_HEARTBEAT = pytest.mark.server_args("--ping-interval", "0.2", "--idle-timeout", "1")
+
+
+@FAST_HEARTBEAT
+def test_server_sends_pings(server):
+    c = server()
+    c.answer_pings = False
+    c.expect("ping", timeout=2)
+
+
+@FAST_HEARTBEAT
+def test_silent_client_is_dropped(server):
+    a = server().register("alice")
+    a.answer_pings = False
+    start = time.monotonic()
+    a.wait_closed(timeout=5)
+    assert time.monotonic() - start < 3
+    again = server()
+    again.send("login", username="alice", password="password1")
+    assert again.expect("login_result")["ok"]
+
+
+@FAST_HEARTBEAT
+def test_client_that_answers_pings_stays_connected(server):
+    c = server().register("alice")
+    c.quiet(timeout=2)
+    c.send("pending")
+    assert c.expect("pending")["users"] == []
+
+
+@FAST_HEARTBEAT
+def test_half_sent_line_does_not_count_as_alive(server):
+    c = server()
+    c.answer_pings = False
+    deadline = time.monotonic() + 3
+    try:
+        while time.monotonic() < deadline:
+            c.send_raw(b" ")
+            time.sleep(0.1)
+    except OSError:
+        pass
+    assert all(frame["type"] == "ping" for frame in c.wait_closed(timeout=5))
+
+
+@pytest.mark.parametrize("text", ["-1", "0", "nan", "inf", "soon"])
+def test_heartbeat_settings_must_be_positive_numbers(text):
+    with pytest.raises((argparse.ArgumentTypeError, ValueError)):
+        chat_server.seconds(text)
+
+
+@pytest.mark.parametrize(
+    "args", [["--ping-interval", "61", "--idle-timeout", "100"], ["--ping-interval", "5", "--idle-timeout", "2"]]
+)
+def test_server_refuses_heartbeat_settings_that_cannot_work(args):
+    result = subprocess.run(
+        [sys.executable, str(REPO / "server.py"), *args], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 2, result.stderr

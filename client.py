@@ -4,6 +4,7 @@ import logging
 import queue
 import socket
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from tkinter import *
@@ -14,6 +15,9 @@ import tls
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5557
 DEFAULT_CAFILE = Path(__file__).with_name("cert.pem")
+# The server pings every 20 s, so this much silence means the connection is dead.
+SERVER_TIMEOUT = 60
+RECONNECT_DELAYS = [1, 2, 4, 8, 15, 30]
 
 log = logging.getLogger("client")
 
@@ -24,20 +28,36 @@ class ServerConnection:
         sock = socket.create_connection((host, port), timeout=5)
         self.sock = tls.LockedSocket(context.wrap_socket(sock, server_hostname=host))
         self.events = events
+        # The reading thread answers pings, so sends come from two threads.
+        self.send_lock = threading.Lock()
+        self.last_seen = time.monotonic()
+
+    def start(self):
+        """Queue each message except pings as (self, message).
+
+        When the connection ends, queue (self, {"type": "disconnected"}).
+        """
         threading.Thread(target=self._read_loop, daemon=True).start()
 
     def send(self, type_, /, **fields):
-        self.sock.sendall((json.dumps({"type": type_, **fields}) + "\n").encode())
+        data = (json.dumps({"type": type_, **fields}) + "\n").encode()
+        with self.send_lock:
+            self.sock.sendall(data)
 
     def _read_loop(self):
         try:
             with self.sock.makefile() as reader:
                 for line in reader:
+                    self.last_seen = time.monotonic()
                     try:
                         message = json.loads(line)
                     except (ValueError, RecursionError):
                         continue
-                    if isinstance(message, dict):
+                    if not isinstance(message, dict):
+                        continue
+                    if message.get("type") == "ping":
+                        self.send("pong")
+                    else:
                         self.events.put((self, message))
         except (OSError, ValueError):
             pass
@@ -55,6 +75,12 @@ members = []
 pending = []
 pending_list = None
 signup_credentials = None
+login_attempt = None
+# Kept while logged in, to log in again after a dropped connection.
+saved_login = None
+# Changes in clear_app_data(), so a reconnect that was already running is ignored.
+session = 0
+reconnect_attempts = 0
 
 
 def connect_to_server():
@@ -63,6 +89,7 @@ def connect_to_server():
         return True
     try:
         server = ServerConnection(args.host, args.port, args.cafile, events)
+        server.start()
         return True
     except FileNotFoundError:
         messagebox.showerror("Connection Error", f"Certificate {args.cafile} not found. Ask the server owner for it.")
@@ -74,7 +101,10 @@ def connect_to_server():
 
 def send(type_, /, **fields):
     if not server:
-        messagebox.showerror("Connection Error", "Not connected to the server.")
+        if current_user:
+            messagebox.showerror("Connection Error", "Reconnecting to the server. Try again in a moment.")
+        else:
+            messagebox.showerror("Connection Error", "Not connected to the server.")
         return
     try:
         server.send(type_, **fields)
@@ -88,10 +118,14 @@ def poll_events():
             conn, message = events.get_nowait()
         except queue.Empty:
             break
-        # Skip events left over from a closed connection.
-        if conn is not server:
-            continue
         try:
+            if callable(message):
+                # Work handed over from another thread.
+                message()
+                continue
+            # Skip events left over from a closed connection.
+            if conn is not server:
+                continue
             handler = EVENT_HANDLERS.get(message.get("type"))
             if handler:
                 handler(message)
@@ -101,13 +135,65 @@ def poll_events():
     root.after(50, poll_events)
 
 
+def check_server_alive():
+    if server and time.monotonic() - server.last_seen > SERVER_TIMEOUT:
+        log.warning("No pings from the server, reconnecting")
+        # The reading thread then reports the connection as dropped.
+        server.close()
+    root.after(5000, check_server_alive)
+
+
+def schedule_reconnect():
+    global reconnect_attempts
+    delay = RECONNECT_DELAYS[min(reconnect_attempts, len(RECONNECT_DELAYS) - 1)]
+    reconnect_attempts += 1
+    set_status(f"Lost connection. Reconnecting in {delay} s...")
+    root.after(delay * 1000, start_reconnect, session)
+
+
+def start_reconnect(for_session):
+    if for_session != session:
+        return
+    set_status("Reconnecting...")
+
+    def connect():
+        try:
+            conn = ServerConnection(args.host, args.port, args.cafile, events)
+        except OSError as e:
+            log.info("Reconnect failed: %s", e)
+            conn = None
+        events.put((None, lambda: finish_reconnect(for_session, conn)))
+
+    # Connecting can take seconds, so keep it off the Tk thread.
+    threading.Thread(target=connect, daemon=True).start()
+
+
+def finish_reconnect(for_session, conn):
+    global server, login_attempt
+    if for_session != session or server:
+        if conn:
+            conn.close()
+        return
+    if not conn:
+        schedule_reconnect()
+        return
+    server = conn
+    server.start()
+    login_attempt = saved_login
+    send("login", username=saved_login[0], password=saved_login[1])
+
+
 def clear_app_data():
-    global server, current_chat, current_user
+    global server, current_chat, current_user, login_attempt, saved_login, session, reconnect_attempts
     if server:
         server.close()
         server = None
     current_chat = None
     current_user = None
+    login_attempt = None
+    saved_login = None
+    session += 1
+    reconnect_attempts = 0
     members.clear()
     pending.clear()
     refresh_pending_list()
@@ -201,19 +287,36 @@ def login():
 
 
 def login_user(username, password):
+    global login_attempt
     if current_user:
         messagebox.showerror("Login", f"Already logged in as {current_user}. Sign out first.")
         return
     if connect_to_server():
+        login_attempt = (username, password)
         send("login", username=username, password=password)
 
 
 def on_login_result(message):
-    global current_user
+    global current_user, login_attempt, saved_login, reconnect_attempts
+    credentials, login_attempt = login_attempt, None
+    # Still logged in from before the connection dropped.
+    reconnected = current_user is not None
     if not message.get("ok"):
-        messagebox.showerror("Login Failed", message.get("error", "Login failed."))
+        error = message.get("error", "Login failed.")
+        if reconnected:
+            clear_app_data()
+            messagebox.showerror("Disconnected", f"Reconnected, but could not log in again: {error}")
+        else:
+            messagebox.showerror("Login Failed", error)
         return
+    saved_login = credentials
     current_user = message["username"]
+    reconnect_attempts = 0
+    if reconnected:
+        set_status("Reconnected.")
+        if current_chat:
+            send("history", username=current_chat)
+        return
     root.title(f"Chat Room! - {current_user}")
     hide_login_required()
     text_input.focus_set()
@@ -225,6 +328,8 @@ def on_friends(message):
     person.delete(0, END)
     for username in message.get("users", []):
         add_member(username)
+    if current_chat in members:
+        person.selection_set(members.index(current_chat))
 
 
 def add_member(username):
@@ -304,10 +409,13 @@ def on_error(message):
 
 
 def on_disconnected(message):
-    was_logged_in = current_user is not None
-    clear_app_data()
-    if was_logged_in:
-        messagebox.showerror("Disconnected", "Lost connection to the server.")
+    global server
+    server.close()
+    server = None
+    if current_user:
+        schedule_reconnect()
+    else:
+        clear_app_data()
 
 
 EVENT_HANDLERS = {
@@ -549,4 +657,5 @@ login_required_frame.place(x=0, y=0, relwidth=1, relheight=1)
 
 show_login_required()
 root.after(50, poll_events)
+root.after(5000, check_server_alive)
 root.mainloop()

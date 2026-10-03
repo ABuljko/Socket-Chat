@@ -40,6 +40,7 @@ python main.py
 
 - To start over with an empty database, run `python initialize_db.py`.
 - After 5 failed logins, each retry waits longer, up to a minute.
+- If the connection drops, the app reconnects and logs you back in.
 - The connection is encrypted with TLS. The app only talks to a server whose certificate matches `cert.pem`.
 - To chat across machines, run `python make_cert.py --host <server address>`, start the server with `--host 0.0.0.0`, and give each user a copy of `cert.pem` (never `key.pem`). They start the app with `--host <server address>`.
 
