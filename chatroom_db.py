@@ -9,25 +9,76 @@ from pathlib import Path
 
 DB_PATH = os.environ.get("CHATROOM_DB", str(Path(__file__).with_name("chatroom.db")))
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    username TEXT PRIMARY KEY,
-    password TEXT
-);
-CREATE TABLE IF NOT EXISTS messages (
-    sender TEXT,
-    receiver TEXT,
-    message TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS requests (
-    sender TEXT,
-    receiver TEXT,
-    status TEXT
-);
-CREATE INDEX IF NOT EXISTS messages_pair ON messages (sender, receiver);
-CREATE INDEX IF NOT EXISTS requests_pair ON requests (sender, receiver);
-"""
+# Each entry takes the database up one version, which is kept in PRAGMA user_version.
+# Never change an entry once it has shipped. Add a new one instead.
+MIGRATIONS = [
+    # 1: NOT NULLs, foreign keys, one request per sender and receiver. Old rows that break these are dropped.
+    [
+        # The tables as they were before versioning, so the steps below always have something to copy.
+        "CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)",
+        "CREATE TABLE IF NOT EXISTS messages (sender TEXT, receiver TEXT, message TEXT, timestamp DATETIME)",
+        "CREATE TABLE IF NOT EXISTS requests (sender TEXT, receiver TEXT, status TEXT)",
+        "ALTER TABLE users RENAME TO old_users",
+        "ALTER TABLE messages RENAME TO old_messages",
+        "ALTER TABLE requests RENAME TO old_requests",
+        """
+        CREATE TABLE users (
+            username TEXT PRIMARY KEY NOT NULL,
+            password TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE messages (
+            sender TEXT NOT NULL REFERENCES users (username) ON DELETE CASCADE,
+            receiver TEXT NOT NULL REFERENCES users (username) ON DELETE CASCADE,
+            message TEXT NOT NULL,
+            timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE requests (
+            sender TEXT NOT NULL REFERENCES users (username) ON DELETE CASCADE,
+            receiver TEXT NOT NULL REFERENCES users (username) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'rejected')),
+            UNIQUE (sender, receiver),
+            CHECK (sender <> receiver)
+        )
+        """,
+        """
+        INSERT INTO users (username, password)
+        SELECT username, password FROM old_users
+        WHERE username IS NOT NULL AND password IS NOT NULL
+        """,
+        """
+        INSERT INTO messages (sender, receiver, message, timestamp)
+        SELECT sender, receiver, message, timestamp FROM old_messages
+        WHERE sender IN (SELECT username FROM users)
+            AND receiver IN (SELECT username FROM users)
+            AND message IS NOT NULL
+            AND timestamp IS NOT NULL
+        ORDER BY rowid
+        """,
+        # Of duplicate requests, keep an accepted one, else the newest.
+        """
+        INSERT INTO requests (sender, receiver, status)
+        SELECT sender, receiver, status FROM old_requests AS o
+        WHERE rowid = (
+                SELECT rowid FROM old_requests
+                WHERE sender = o.sender AND receiver = o.receiver AND status IN ('pending', 'accepted', 'rejected')
+                ORDER BY status = 'accepted' DESC, rowid DESC
+                LIMIT 1
+            )
+            AND sender <> receiver
+            AND sender IN (SELECT username FROM users)
+            AND receiver IN (SELECT username FROM users)
+        """,
+        "DROP TABLE old_users",
+        "DROP TABLE old_messages",
+        "DROP TABLE old_requests",
+        "CREATE INDEX messages_pair ON messages (sender, receiver)",
+        "CREATE INDEX requests_receiver ON requests (receiver)",
+    ],
+]
 
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
 
@@ -37,22 +88,46 @@ _write_lock = threading.Lock()
 
 
 def connect():
-    return closing(sqlite3.connect(DB_PATH, timeout=10))
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    # SQLite checks foreign keys only on connections that turn them on.
+    conn.execute("PRAGMA foreign_keys = ON")
+    return closing(conn)
+
+
+def schema_version():
+    with connect() as conn:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
 def init_db():
-    with connect() as conn:
-        conn.executescript(SCHEMA)
+    # A plain connection: foreign keys stay off while tables are rebuilt, and the transaction is ours to run.
+    with closing(sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > len(MIGRATIONS):
+                raise RuntimeError(f"{DB_PATH} is schema version {version}, newer than this app knows.")
+            for number, statements in enumerate(MIGRATIONS[version:], start=version + 1):
+                for statement in statements:
+                    conn.execute(statement)
+                conn.execute(f"PRAGMA user_version = {number}")
+                if conn.execute("PRAGMA foreign_key_check").fetchone():
+                    raise RuntimeError(f"Migration {number} left rows pointing at missing users.")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def reset_db():
-    with connect() as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
         conn.executescript("""
-            DROP TABLE IF EXISTS users;
             DROP TABLE IF EXISTS messages;
             DROP TABLE IF EXISTS requests;
+            DROP TABLE IF EXISTS users;
+            PRAGMA user_version = 0;
         """)
-        conn.executescript(SCHEMA)
+    init_db()
 
 
 def hash_password(password):
@@ -79,10 +154,17 @@ def add_user(username, password):
     return True
 
 
+# Checked when the user doesn't exist, so that takes as long as a wrong password.
+_DUMMY_HASH = hash_password("not a real password")
+
+
 def check_user(username, password):
     with connect() as conn:
         row = conn.execute("SELECT password FROM users WHERE username = ?", (username,)).fetchone()
-    return row is not None and verify_password(password, row[0])
+    if row is None:
+        verify_password(password, _DUMMY_HASH)
+        return False
+    return verify_password(password, row[0])
 
 
 def user_exists(username):
@@ -107,8 +189,13 @@ def add_request(sender, receiver):
                 (receiver, sender),
             )
             return "accepted"
-        conn.execute("DELETE FROM requests WHERE sender = ? AND receiver = ?", (sender, receiver))
-        conn.execute("INSERT INTO requests (sender, receiver, status) VALUES (?, ?, 'pending')", (sender, receiver))
+        conn.execute(
+            """
+            INSERT INTO requests (sender, receiver, status) VALUES (?, ?, 'pending')
+            ON CONFLICT (sender, receiver) DO UPDATE SET status = 'pending'
+            """,
+            (sender, receiver),
+        )
         return "sent"
 
 
@@ -126,7 +213,7 @@ def respond_to_request(sender, receiver, accept):
 def get_requests(username):
     with connect() as conn:
         rows = conn.execute(
-            "SELECT DISTINCT sender FROM requests WHERE receiver = ? AND status = 'pending' ORDER BY sender",
+            "SELECT sender FROM requests WHERE receiver = ? AND status = 'pending' ORDER BY sender",
             (username,),
         ).fetchall()
     return [row[0] for row in rows]

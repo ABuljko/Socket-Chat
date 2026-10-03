@@ -38,12 +38,17 @@ def cert(tmp_path_factory):
 
 
 @pytest.fixture
-def server(tmp_path, cert):
-    """Start server.py on a free port with its own database."""
+def server(tmp_path, cert, request):
+    """Start server.py on a free port with its own database.
+
+    Extra command line arguments come from @pytest.mark.server_args(...).
+    """
+    marker = request.node.get_closest_marker("server_args")
     port = free_port()
     proc = subprocess.Popen(
         [sys.executable, "-u", str(REPO / "server.py"), "--port", str(port), "--db", str(tmp_path / "server.db")]
-        + ["--cert", str(cert[0]), "--key", str(cert[1])],
+        + ["--cert", str(cert[0]), "--key", str(cert[1])]
+        + (list(marker.args) if marker else []),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -81,6 +86,7 @@ class Client:
     def __init__(self, port, context):
         self.sock = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=5), server_hostname=HOST)
         self.buffer = b""
+        self.answer_pings = True
 
     def send(self, type_, /, **fields):
         self.send_raw((json.dumps({"type": type_, **fields}) + "\n").encode())
@@ -89,14 +95,22 @@ class Client:
         self.sock.sendall(data)
 
     def _next(self, timeout):
-        while b"\n" not in self.buffer:
-            self.sock.settimeout(timeout)
-            data = self.sock.recv(65536)
-            if not data:
-                return None
-            self.buffer += data
-        line, self.buffer = self.buffer.split(b"\n", 1)
-        return json.loads(line)
+        deadline = time.monotonic() + timeout
+        while True:
+            while b"\n" not in self.buffer:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                self.sock.settimeout(left)
+                data = self.sock.recv(65536)
+                if not data:
+                    return None
+                self.buffer += data
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            frame = json.loads(line)
+            if not (self.answer_pings and frame["type"] == "ping"):
+                return frame
+            self.send("pong")
 
     def expect(self, type_, timeout=15):
         """Return the next frame and check its type."""
