@@ -18,8 +18,6 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["F", "E9", "B", "UP"]
-# Allow `from tkinter import *` in client.py.
-ignore = ["F403", "F405"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
