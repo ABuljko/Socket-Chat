@@ -33,6 +33,22 @@ def test_add_and_check_user(db_path):
     assert not db.user_exists("nobody")
 
 
+def test_unknown_user_still_runs_scrypt(db_path, monkeypatch):
+    db.add_user("alice", "password1")
+    calls = []
+    real_verify = db.verify_password
+
+    def spy(password, stored):
+        calls.append(stored)
+        return real_verify(password, stored)
+
+    monkeypatch.setattr(db, "verify_password", spy)
+    assert not db.check_user("nobody", "password1")
+    assert not db.check_user("alice", "wrong-password")
+    assert len(calls) == 2
+    assert calls[0].split("$")[:4] == calls[1].split("$")[:4]
+
+
 def test_friend_request_lifecycle(db_path):
     assert db.add_request("alice", "bob") == "sent"
     assert db.add_request("alice", "bob") == "pending"

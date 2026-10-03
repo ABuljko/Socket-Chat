@@ -2,12 +2,14 @@
 
 import argparse
 import json
+import math
 import queue
 import re
 import socket
 import ssl
 import sys
 import threading
+import time
 from pathlib import Path
 
 import chatroom_db as db
@@ -22,6 +24,10 @@ MAX_QUEUED = 1000
 MAX_MESSAGE = 2000
 MIN_PASSWORD, MAX_PASSWORD = 8, 128
 USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+LOGIN_FREE_FAILURES = 5
+LOGIN_MAX_WAIT = 60
+LOGIN_FORGET = 15 * 60
+LOGIN_MAX_TRACKED = 10_000
 
 clients = {}
 clients_lock = threading.Lock()
@@ -38,8 +44,9 @@ class BadRequest(Exception):
 class Connection:
     """Sends from a bounded queue on its own thread, so a slow client can't block others."""
 
-    def __init__(self, sock):
+    def __init__(self, sock, host=None):
         self.sock = sock
+        self.host = host
         self.reader = sock.makefile()
         self.outbox = queue.Queue(MAX_QUEUED)
         self.writer = threading.Thread(target=self._write_loop, daemon=True)
@@ -99,6 +106,56 @@ class Connection:
         self.sock.close()
 
 
+class LoginThrottle:
+    """An attempt counts as a failure until it succeeds, so parallel attempts can't slip past the limit."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.failures = {}  # key -> (count, time of the last attempt)
+        self.lock = threading.Lock()
+
+    def _get(self, key, now):
+        count, last = self.failures.get(key, (0, now))
+        if now - last >= LOGIN_FORGET:
+            return 0, now
+        return count, last
+
+    def _wait(self, count, last, now):
+        if count < LOGIN_FREE_FAILURES:
+            return 0
+        return max(0, last + min(2 ** (count - LOGIN_FREE_FAILURES), LOGIN_MAX_WAIT) - now)
+
+    def begin(self, host, username):
+        """Return the seconds left to wait, or 0 after counting the attempt."""
+        keys = [("ip", host), ("user", username)]
+        with self.lock:
+            now = self.clock()
+            if len(self.failures) > LOGIN_MAX_TRACKED:
+                self.failures = {key: value for key, value in self.failures.items() if now - value[1] < LOGIN_FORGET}
+            states = [self._get(key, now) for key in keys]
+            wait = max(self._wait(count, last, now) for count, last in states)
+            if wait:
+                return wait
+            for key, (count, _) in zip(keys, states, strict=True):
+                self.failures[key] = (count + 1, now)
+            return 0
+
+    def succeeded(self, host, username):
+        """Undo the IP's count from begin() and clear the username."""
+        with self.lock:
+            self.failures.pop(("user", username), None)
+            key = ("ip", host)
+            if key in self.failures:
+                count, last = self.failures[key]
+                if count > 1:
+                    self.failures[key] = (count - 1, last)
+                else:
+                    del self.failures[key]
+
+
+login_throttle = LoginThrottle()
+
+
 def send_to(recipient, type_, /, **fields):
     with clients_lock:
         conn = clients.get(recipient)
@@ -138,11 +195,17 @@ def handle_signup(conn, message):
 def handle_login(conn, message):
     if conn.username:
         raise BadRequest("Already logged in.")
-    username = text_field(message, "username")
+    username = username_field(message)
     password = text_field(message, "password")
+    if len(password) > MAX_PASSWORD:
+        raise BadRequest(f"Passwords are at most {MAX_PASSWORD} characters.")
+    if wait := login_throttle.begin(conn.host, username):
+        conn.send("login_result", ok=False, error=f"Too many failed logins. Try again in {math.ceil(wait)} s.")
+        return
     if not db.check_user(username, password):
         conn.send("login_result", ok=False, error="Invalid credentials.")
         return
+    login_throttle.succeeded(conn.host, username)
     conn.username = username
     with clients_lock:
         previous = clients.get(username)
@@ -245,7 +308,7 @@ def handle_client(sock, addr, context):
         print(f"TLS handshake with {addr} failed: {e}")
         sock.close()
         return
-    conn = Connection(tls.LockedSocket(sock))
+    conn = Connection(tls.LockedSocket(sock), addr[0])
     try:
         while (message := conn.receive()) is not None:
             handlers = USER_HANDLERS if conn.username else GUEST_HANDLERS

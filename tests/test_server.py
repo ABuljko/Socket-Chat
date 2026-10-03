@@ -1,5 +1,9 @@
 import json
 
+import pytest
+
+import server as chat_server
+
 
 def friends(server, first="alice", second="bob"):
     a = server().register(first)
@@ -155,3 +159,122 @@ def test_odd_but_valid_input_keeps_connection(server):
     c.expect("error")
     c.send("signup", username="alice", password="password1")
     assert c.expect("signup_result")["ok"]
+
+
+def wrong_logins(c, username, times=chat_server.LOGIN_FREE_FAILURES):
+    for _ in range(times):
+        c.send("login", username=username, password="wrong-password")
+        assert c.expect("login_result")["error"] == "Invalid credentials."
+
+
+def test_unknown_user_and_wrong_password_look_the_same(server):
+    server().register("alice")
+    c = server()
+    for username in ["alice", "nobody"]:
+        c.send("login", username=username, password="wrong-password")
+        assert c.expect("login_result") == {"type": "login_result", "ok": False, "error": "Invalid credentials."}
+
+
+def test_failed_logins_lock_the_username(server):
+    server().register("alice")
+    c = server()
+    wrong_logins(c, "alice")
+    c.send("login", username="alice", password="password1")
+    result = c.expect("login_result")
+    assert result["ok"] is False and result["error"].startswith("Too many failed logins.")
+
+
+def test_failed_logins_for_any_names_lock_the_ip(server):
+    server().register("alice")
+    c = server()
+    for i in range(chat_server.LOGIN_FREE_FAILURES):
+        wrong_logins(c, f"nobody{i}", times=1)
+    c.send("login", username="alice", password="password1")
+    assert c.expect("login_result")["error"].startswith("Too many failed logins.")
+
+
+def test_successful_logins_do_not_lock_the_ip(server):
+    server().register("alice")
+    for _ in range(chat_server.LOGIN_FREE_FAILURES + 2):
+        c = server()
+        c.send("login", username="alice", password="password1")
+        assert c.expect("login_result")["ok"]
+        c.close()
+
+
+def test_login_validation(server):
+    c = server()
+    for username, password in [("bad name", "password1"), ("x" * 33, "password1"), ("alice", "x" * 129)]:
+        c.send("login", username=username, password=password)
+        c.expect("error")
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def clock():
+    return FakeClock()
+
+
+@pytest.fixture
+def throttle(clock):
+    return chat_server.LoginThrottle(clock)
+
+
+def fail(throttle, host, username, times=1):
+    for _ in range(times):
+        assert throttle.begin(host, username) == 0
+
+
+def test_throttle_wait_doubles_up_to_the_cap(throttle, clock):
+    fail(throttle, "1.1.1.1", "alice", chat_server.LOGIN_FREE_FAILURES)
+    waits = []
+    for _ in range(10):
+        waits.append(throttle.begin("1.1.1.1", "alice"))
+        clock.now += waits[-1]
+        fail(throttle, "1.1.1.1", "alice")
+    assert waits == [1, 2, 4, 8, 16, 32, 60, 60, 60, 60]
+
+
+def test_throttle_locks_a_username_across_ips(throttle):
+    for i in range(chat_server.LOGIN_FREE_FAILURES):
+        fail(throttle, f"10.0.0.{i}", "alice")
+    assert throttle.begin("10.0.0.99", "alice") > 0
+    assert throttle.begin("10.0.0.99", "bob") == 0
+
+
+def test_throttle_counts_attempts_still_in_progress(throttle):
+    for _ in range(chat_server.LOGIN_FREE_FAILURES):
+        assert throttle.begin("1.1.1.1", "alice") == 0
+    assert throttle.begin("1.1.1.1", "alice") > 0
+
+
+def test_throttle_success_clears_the_username_but_not_other_ip_failures(throttle):
+    fail(throttle, "1.1.1.1", "nobody", chat_server.LOGIN_FREE_FAILURES - 1)
+    fail(throttle, "1.1.1.1", "alice")
+    throttle.succeeded("1.1.1.1", "alice")
+    assert ("user", "alice") not in throttle.failures
+    fail(throttle, "1.1.1.1", "bob")
+    assert throttle.begin("1.1.1.1", "carol") > 0
+
+
+def test_throttle_forgets_old_failures(throttle, clock):
+    fail(throttle, "1.1.1.1", "alice", chat_server.LOGIN_FREE_FAILURES)
+    clock.now += chat_server.LOGIN_FORGET
+    assert throttle.begin("1.1.1.1", "alice") == 0
+
+
+def test_throttle_prunes_stale_entries(throttle, clock, monkeypatch):
+    monkeypatch.setattr(chat_server, "LOGIN_MAX_TRACKED", 4)
+    for i in range(3):
+        fail(throttle, "1.1.1.1", f"user{i}")
+    clock.now += chat_server.LOGIN_FORGET
+    fail(throttle, "2.2.2.2", "fresh")
+    fail(throttle, "2.2.2.2", "fresh")
+    assert set(throttle.failures) == {("ip", "2.2.2.2"), ("user", "fresh")}

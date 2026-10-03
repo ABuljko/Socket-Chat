@@ -79,10 +79,17 @@ def add_user(username, password):
     return True
 
 
+# Checked when the user doesn't exist, so that takes as long as a wrong password.
+_DUMMY_HASH = hash_password("not a real password")
+
+
 def check_user(username, password):
     with connect() as conn:
         row = conn.execute("SELECT password FROM users WHERE username = ?", (username,)).fetchone()
-    return row is not None and verify_password(password, row[0])
+    if row is None:
+        verify_password(password, _DUMMY_HASH)
+        return False
+    return verify_password(password, row[0])
 
 
 def user_exists(username):
