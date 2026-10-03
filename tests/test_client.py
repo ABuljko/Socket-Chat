@@ -253,7 +253,7 @@ def test_reconnects_and_logs_in_again(app, connector):
     assert old.closed and app.server is None
     assert app.view.logged_in == "alice"
     assert app.view.status == "Lost connection. Reconnecting in 1 s..."
-    assert app.send_message("lost?") is True
+    assert app.send_message("lost?") is False
     assert app.view.errors[-1] == ("Connection Error", "Reconnecting to the server. Try again in a moment.")
 
     assert app.view.run_scheduled("start_reconnect") == [1000]
@@ -339,3 +339,32 @@ def test_exit_asks_first(app, connector):
     app.view.confirm_answer = True
     app.exit()
     assert app.view.closed and conn.closed
+
+
+def test_second_login_waits_for_the_first(app, connector):
+    app.login_user("alice", "alice-password")
+    app.login_user("bob", "bob-password")
+    app.signup_user("carol", "carol-password")
+    assert app.view.errors == [("Please Wait", "Still waiting for the server to answer.")] * 2
+    conn = connector.connections[0]
+    assert [m["type"] for m in conn.sent] == ["login"]
+    conn.receive("login_result", ok=True, username="alice")
+    app.process_events()
+    assert app.current_user == "alice"
+    assert app.saved_login == ("alice", "alice-password")
+
+
+def test_login_result_nobody_asked_for_is_ignored(app, connector):
+    app.signup_user("alice", "password1")
+    connector.connections[0].receive("login_result", ok=True, username="mallory")
+    app.process_events()
+    assert app.current_user is None
+
+
+def test_drop_while_logging_in_is_reported(app, connector):
+    app.login_user("alice", "password1")
+    connector.connections[0].drop()
+    app.process_events()
+    assert app.view.errors == [("Disconnected", "Lost connection to the server.")]
+    app.login_user("alice", "password1")
+    assert len(connector.connections) == 2

@@ -83,16 +83,19 @@ class ChatApp:
         return True
 
     def send(self, type_, /, **fields):
+        """Return False, after telling the user, if the message couldn't be sent."""
         if not self.server:
             if self.current_user:
                 self.view.show_error("Connection Error", "Reconnecting to the server. Try again in a moment.")
             else:
                 self.view.show_error("Connection Error", "Not connected to the server.")
-            return
+            return False
         try:
             self.server.send(type_, **fields)
         except OSError as e:
             self.view.show_error("Connection Error", f"Failed to reach the server: {e}")
+            return False
+        return True
 
     def process_events(self):
         while True:
@@ -168,6 +171,7 @@ class ChatApp:
             self.server = None
         self.current_user = None
         self.current_chat = None
+        self.signup_credentials = None
         self.login_attempt = None
         self.saved_login = None
         self.session += 1
@@ -179,6 +183,13 @@ class ChatApp:
         self.view.set_chat(None, [])
         self.view.set_status("")
         self.view.set_logged_in(None)
+
+    def waiting_for_answer(self):
+        """A second login or signup before the first is answered would mix up which password belongs to whom."""
+        if self.login_attempt or self.signup_credentials:
+            self.view.show_error("Please Wait", "Still waiting for the server to answer.")
+            return True
+        return False
 
     def require_login(self):
         if not self.current_user:
@@ -193,6 +204,8 @@ class ChatApp:
         if self.current_user:
             self.view.show_error("Sign Up", "Sign out first.")
             return
+        if self.waiting_for_answer():
+            return
         if self.connect_to_server():
             self.signup_credentials = (username, password)
             self.send("signup", username=username, password=password)
@@ -203,6 +216,8 @@ class ChatApp:
     def login_user(self, username, password):
         if self.current_user:
             self.view.show_error("Login", f"Already logged in as {self.current_user}. Sign out first.")
+            return
+        if self.waiting_for_answer():
             return
         if self.connect_to_server():
             self.login_attempt = (username, password)
@@ -248,14 +263,13 @@ class ChatApp:
         self.send("history", username=username)
 
     def send_message(self, text):
-        """Return True if the input can be cleared."""
+        """Return True if the text was sent and the input can be cleared."""
         if not text.strip():
             return False
         if not self.current_chat:
             self.view.show_error("Send Error", "Pick a member to chat with first.")
             return False
-        self.send("message", to=self.current_chat, text=text)
-        return True
+        return self.send("message", to=self.current_chat, text=text)
 
     def format_message(self, message):
         sender = "You" if message["sender"] == self.current_user else message["sender"]
@@ -274,6 +288,9 @@ class ChatApp:
 
     def on_login_result(self, message):
         credentials, self.login_attempt = self.login_attempt, None
+        if credentials is None:
+            log.warning("Ignoring a login result nobody asked for")
+            return
         # Still logged in from before the connection dropped.
         reconnected = self.current_user is not None
         if not message.get("ok"):
@@ -285,7 +302,8 @@ class ChatApp:
                 self.view.show_error("Login Failed", error)
             return
         self.saved_login = credentials
-        self.current_user = message["username"]
+        # The name that was sent, so it always matches the saved password.
+        self.current_user = credentials[0]
         self.reconnect_attempts = 0
         if reconnected:
             self.view.set_status("Reconnected.")
@@ -351,5 +369,8 @@ class ChatApp:
         self.server = None
         if self.current_user:
             self.schedule_reconnect()
-        else:
-            self.reset()
+            return
+        was_waiting = self.login_attempt or self.signup_credentials
+        self.reset()
+        if was_waiting:
+            self.view.show_error("Disconnected", "Lost connection to the server.")
