@@ -1,9 +1,9 @@
 import argparse
 import json
+import logging
 import queue
 import socket
 import threading
-import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from tkinter import *
@@ -14,6 +14,8 @@ import tls
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5557
 DEFAULT_CAFILE = Path(__file__).with_name("cert.pem")
+
+log = logging.getLogger("client")
 
 
 class ServerConnection:
@@ -95,7 +97,7 @@ def poll_events():
                 handler(message)
         except Exception:
             # A bad event must not stop the event loop.
-            traceback.print_exc()
+            log.exception("Error handling a server event")
     root.after(50, poll_events)
 
 
@@ -450,6 +452,7 @@ parser.add_argument(
     "--cafile", default=DEFAULT_CAFILE, help="server certificate to trust (default: cert.pem next to this script)"
 )
 args = parser.parse_args()
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s")
 
 root = Tk()
 root.geometry("800x640")

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import math
 import queue
 import re
@@ -28,6 +29,8 @@ LOGIN_FREE_FAILURES = 5
 LOGIN_MAX_WAIT = 60
 LOGIN_FORGET = 15 * 60
 LOGIN_MAX_TRACKED = 10_000
+
+log = logging.getLogger("server")
 
 clients = {}
 clients_lock = threading.Lock()
@@ -200,9 +203,11 @@ def handle_login(conn, message):
     if len(password) > MAX_PASSWORD:
         raise BadRequest(f"Passwords are at most {MAX_PASSWORD} characters.")
     if wait := login_throttle.begin(conn.host, username):
+        log.warning("Login for %s from %s throttled for %.0f s", username, conn.host, wait)
         conn.send("login_result", ok=False, error=f"Too many failed logins. Try again in {math.ceil(wait)} s.")
         return
     if not db.check_user(username, password):
+        log.info("Failed login for %s from %s", username, conn.host)
         conn.send("login_result", ok=False, error="Invalid credentials.")
         return
     login_throttle.succeeded(conn.host, username)
@@ -305,7 +310,7 @@ def handle_client(sock, addr, context):
         sock.settimeout(tls.HANDSHAKE_TIMEOUT)
         sock = context.wrap_socket(sock, server_side=True)
     except OSError as e:
-        print(f"TLS handshake with {addr} failed: {e}")
+        log.warning("TLS handshake with %s failed: %s", addr, e)
         sock.close()
         return
     conn = Connection(tls.LockedSocket(sock), addr[0])
@@ -323,27 +328,27 @@ def handle_client(sock, addr, context):
                 conn.send("error", text=str(e))
     except ProtocolError as e:
         conn.send("error", text=f"Protocol error: {e}.")
-        print(f"Dropping {addr}: {e}")
+        log.warning("Dropping %s: %s", addr, e)
     except OSError:
         pass
-    except Exception as e:
-        print(f"Error handling {addr}: {e!r}")
+    except Exception:
+        log.exception("Error handling %s", addr)
     finally:
         if conn.username:
             with clients_lock:
                 if clients.get(conn.username) is conn:
                     del clients[conn.username]
         conn.close()
-        print(f"Disconnected {addr}")
+        log.info("Disconnected %s", addr)
 
 
 def start_server(context, host=DEFAULT_HOST, port=DEFAULT_PORT):
     db.init_db()
     with socket.create_server((host, port)) as server:
-        print(f"Server listening on {host}:{port} (TLS)")
+        log.info("Server listening on %s:%s (TLS)", host, port)
         while True:
             client_socket, addr = server.accept()
-            print(f"Connection from {addr}")
+            log.info("Connection from %s", addr)
             threading.Thread(target=handle_client, args=(client_socket, addr, context), daemon=True).start()
 
 
@@ -355,6 +360,7 @@ def main():
     parser.add_argument("--cert", default=DEFAULT_CERT, help="TLS certificate (default: cert.pem next to this script)")
     parser.add_argument("--key", default=DEFAULT_KEY, help="TLS private key (default: key.pem next to this script)")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.db:
         db.DB_PATH = args.db
     for path in (args.cert, args.key):
