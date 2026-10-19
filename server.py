@@ -6,6 +6,7 @@ import logging
 import math
 import queue
 import re
+import secrets
 import socket
 import ssl
 import sys
@@ -25,6 +26,7 @@ MAX_QUEUED = 1000
 MAX_MESSAGE = 2000
 MIN_PASSWORD, MAX_PASSWORD = 8, 128
 USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,32}")
+SESSION_RE = re.compile(r"[0-9a-f]{32}")
 LOGIN_FREE_FAILURES = 5
 LOGIN_MAX_WAIT = 60
 LOGIN_FORGET = 15 * 60
@@ -37,6 +39,7 @@ CLIENT_TIMEOUT = 60
 log = logging.getLogger("server")
 
 clients = {}
+sessions = {}
 clients_lock = threading.Lock()
 connections = set()
 connections_lock = threading.Lock()
@@ -210,6 +213,9 @@ def handle_login(conn, message):
     password = text_field(message, "password")
     if len(password) > MAX_PASSWORD:
         raise BadRequest(f"Passwords are at most {MAX_PASSWORD} characters.")
+    session = message.get("session")
+    if session is not None and not (isinstance(session, str) and SESSION_RE.fullmatch(session)):
+        raise BadRequest("Invalid session.")
     if wait := login_throttle.begin(conn.host, username):
         log.warning("Login for %s from %s throttled for %.0f s", username, conn.host, wait)
         conn.send("login_result", ok=False, error=f"Too many failed logins. Try again in {math.ceil(wait)} s.")
@@ -219,14 +225,22 @@ def handle_login(conn, message):
         conn.send("login_result", ok=False, error="Invalid credentials.")
         return
     login_throttle.succeeded(conn.host, username)
-    conn.username = username
     with clients_lock:
-        previous = clients.get(username)
-        clients[username] = conn
+        # A session this server never gave out is fine: it was restarted.
+        replaced = session is not None and sessions.get(username, session) != session
+        if not replaced:
+            session = session or secrets.token_hex(16)
+            sessions[username] = session
+            previous = clients.get(username)
+            clients[username] = conn
+            conn.username = username
+    if replaced:
+        conn.send("login_result", ok=False, error="You logged in from another window.")
+        return
     if previous:
-        previous.send("error", text="You logged in from another window.")
+        previous.send("signed_out", text="You logged in from another window.")
         previous.finish()
-    conn.send("login_result", ok=True, username=username)
+    conn.send("login_result", ok=True, username=username, session=session)
     conn.send("friends", users=db.get_friends(username))
     conn.send("pending", users=db.get_requests(username))
 

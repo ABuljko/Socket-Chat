@@ -126,10 +126,13 @@ def app(connector):
     return chat
 
 
+SESSION = "ab" * 16
+
+
 def log_in(app, connector, username="alice", friends=("bob",)):
     app.login_user(username, "password1")
     conn = connector.connections[-1]
-    conn.receive("login_result", ok=True, username=username)
+    conn.receive("login_result", ok=True, username=username, session=SESSION)
     conn.receive("friends", users=list(friends))
     conn.receive("pending", users=[])
     app.process_events()
@@ -260,8 +263,8 @@ def test_reconnects_and_logs_in_again(app, connector):
     app.process_events()
     new = connector.connections[-1]
     assert new is not old and new.started
-    assert new.sent == [{"type": "login", "username": "alice", "password": "password1"}]
-    new.receive("login_result", ok=True, username="alice")
+    assert new.sent == [{"type": "login", "username": "alice", "password": "password1", "session": SESSION}]
+    new.receive("login_result", ok=True, username="alice", session=SESSION)
     new.receive("friends", users=["bob"])
     app.process_events()
     assert app.view.status == "Reconnected."
@@ -269,6 +272,26 @@ def test_reconnects_and_logs_in_again(app, connector):
     assert app.view.selected == "bob"
     assert app.view.infos == [("Login Success", "Login successful.")]
     assert app.reconnect_attempts == 0
+
+
+def test_login_from_another_window_signs_out(app, connector):
+    conn = log_in(app, connector)
+    conn.receive("signed_out", text="You logged in from another window.")
+    conn.drop()
+    app.process_events()
+    assert conn.closed and app.server is None
+    assert app.view.logged_in is None and app.saved_login is None
+    assert app.view.infos[-1] == ("Signed Out", "You logged in from another window.")
+    assert app.view.errors == []
+    assert not app.view.run_scheduled("start_reconnect")
+    assert len(connector.connections) == 1
+
+
+def test_fresh_login_after_sign_out_sends_no_session(app, connector):
+    log_in(app, connector)
+    app.sign_out()
+    app.login_user("alice", "password1")
+    assert connector.connections[-1].sent == [{"type": "login", "username": "alice", "password": "password1"}]
 
 
 def test_reconnect_backs_off(app, connector):

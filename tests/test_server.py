@@ -32,7 +32,9 @@ def test_signup_then_login_on_same_connection(server):
     c.send("login", username="alice", password="wrong-password")
     assert c.expect("login_result")["ok"] is False
     c.send("login", username="alice", password="password1")
-    assert c.expect("login_result") == {"type": "login_result", "ok": True, "username": "alice"}
+    result = c.expect("login_result")
+    assert chat_server.SESSION_RE.fullmatch(result.pop("session"))
+    assert result == {"type": "login_result", "ok": True, "username": "alice"}
     assert c.expect("friends")["users"] == []
     assert c.expect("pending")["users"] == []
 
@@ -134,11 +136,49 @@ def test_second_login_replaces_first(server):
     assert again.expect("friends")["users"] == ["bob"]
     again.expect("pending")
     frames = a.wait_closed()
-    assert frames and frames[0]["type"] == "error"
+    assert frames and frames[0] == {"type": "signed_out", "text": "You logged in from another window."}
 
     b.send("message", to="alice", text="still there?")
     b.expect("message")
     assert again.expect("message")["text"] == "still there?"
+
+
+def login_result(c, username="alice", **fields):
+    c.send("login", username=username, password="password1", **fields)
+    return c.expect("login_result")
+
+
+def test_window_that_missed_signed_out_cannot_log_back_in(server):
+    old = server().register("alice")
+    first = login_result(server())["session"]
+    old.wait_closed()
+    back = login_result(server(), session=first)
+    assert back["ok"] and back["session"] == first
+
+    newer = login_result(server())["session"]
+    assert newer != first
+    late = server()
+    assert login_result(late, session=first) == {
+        "type": "login_result",
+        "ok": False,
+        "error": "You logged in from another window.",
+    }
+    late.send("pending")
+    assert late.expect("error")["text"] == "Invalid request."
+
+    c = server()
+    c.send("signup", username="bob", password="password1")
+    assert c.expect("signup_result")["ok"]
+    unknown = "0" * 32
+    assert login_result(c, "bob", session=unknown)["session"] == unknown
+
+
+def test_session_validation(server):
+    server().register("alice")
+    c = server()
+    for session in [5, "", "x" * 32, "A" * 32, "0" * 31, "0" * 33, ["0" * 32]]:
+        c.send("login", username="alice", password="password1", session=session)
+        assert c.expect("error")["text"] == "Invalid session."
 
 
 def test_invalid_json_closes_connection_with_error(server):

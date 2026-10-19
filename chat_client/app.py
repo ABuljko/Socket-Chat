@@ -42,6 +42,7 @@ class ChatApp:
         self.login_attempt = None
         # Kept while logged in, to log in again after a dropped connection.
         self.saved_login = None
+        self.resume_token = None
         # Changes on every reset, so a reconnect that was already running is ignored.
         self.session = 0
         self.reconnect_attempts = 0
@@ -57,6 +58,7 @@ class ChatApp:
             "message": self.on_message,
             "info": self.on_info,
             "error": self.on_error,
+            "signed_out": self.on_signed_out,
             "disconnected": self.on_disconnected,
         }
         self.view = make_view(self)
@@ -163,7 +165,7 @@ class ChatApp:
         self.server.start()
         self.login_attempt = self.saved_login
         username, password = self.saved_login
-        self.send("login", username=username, password=password)
+        self.send("login", username=username, password=password, session=self.resume_token)
 
     def reset(self):
         if self.server:
@@ -174,6 +176,7 @@ class ChatApp:
         self.signup_credentials = None
         self.login_attempt = None
         self.saved_login = None
+        self.resume_token = None
         self.session += 1
         self.reconnect_attempts = 0
         self.members.clear()
@@ -302,6 +305,7 @@ class ChatApp:
                 self.view.show_error("Login Failed", error)
             return
         self.saved_login = credentials
+        self.resume_token = message.get("session")
         # The name that was sent, so it always matches the saved password.
         self.current_user = credentials[0]
         self.reconnect_attempts = 0
@@ -363,6 +367,10 @@ class ChatApp:
 
     def on_error(self, message):
         self.view.show_error("Error", message.get("text", "Unknown error."))
+
+    def on_signed_out(self, message):
+        self.reset()
+        self.view.show_info("Signed Out", message.get("text", "Signed out by the server."))
 
     def on_disconnected(self, message):
         self.server.close()
