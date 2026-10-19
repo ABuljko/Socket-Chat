@@ -38,6 +38,7 @@ class ChatApp:
         self.current_chat = None
         self.members = []
         self.pending = []
+        self.answering = set()
         self.signup_credentials = None
         self.login_attempt = None
         # Kept while logged in, to log in again after a dropped connection.
@@ -181,6 +182,7 @@ class ChatApp:
         self.reconnect_attempts = 0
         self.members.clear()
         self.pending.clear()
+        self.answering.clear()
         self.view.set_pending(self.pending)
         self.view.set_members(self.members, None)
         self.view.set_chat(None, [])
@@ -255,10 +257,10 @@ class ChatApp:
             self.send("pending")
 
     def respond_request(self, username, accept):
-        self.send("respond_request", username=username, accept=accept)
-        if username in self.pending:
-            self.pending.remove(username)
-        self.view.set_pending(self.pending)
+        if username in self.answering:
+            return
+        if self.send("respond_request", username=username, accept=accept):
+            self.answering.add(username)
 
     def select_chat(self, username):
         self.current_chat = username
@@ -336,6 +338,7 @@ class ChatApp:
 
     def on_pending(self, message):
         self.pending[:] = message.get("users", [])
+        self.answering.intersection_update(self.pending)
         self.view.set_pending(self.pending)
         if self.pending:
             self.view.set_status(f"Pending requests: {len(self.pending)}")
@@ -375,6 +378,7 @@ class ChatApp:
     def on_disconnected(self, message):
         self.server.close()
         self.server = None
+        self.answering.clear()
         if self.current_user:
             self.schedule_reconnect()
             return

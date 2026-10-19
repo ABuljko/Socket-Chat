@@ -270,6 +270,7 @@ def handle_respond_request(conn, message):
     if not isinstance(accept, bool):
         raise BadRequest("Missing field: accept.")
     if not db.respond_to_request(requester, conn.username, accept):
+        conn.send("pending", users=db.get_requests(conn.username))
         raise BadRequest(f"No pending request from {requester}.")
     if accept:
         conn.send("friend_added", username=requester)

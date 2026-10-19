@@ -70,15 +70,24 @@ class PendingDialog:
         scrollbar.config(command=self.list.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.list.bind("<<ListboxSelect>>", lambda event: self._update_buttons())
 
         buttons = tk.Frame(self.window)
-        tk.Button(buttons, text="Accept", command=lambda: self.respond(True), bg="green", fg="white", width=6).pack(
-            side=tk.LEFT, padx=5
+        self.accept = tk.Button(
+            buttons, text="Accept", command=lambda: self.respond(True), bg="green", fg="white", width=6
         )
-        tk.Button(buttons, text="Reject", command=lambda: self.respond(False), bg="red", fg="white", width=6).pack(
-            side=tk.RIGHT, padx=5
+        self.accept.pack(side=tk.LEFT, padx=5)
+        self.reject = tk.Button(
+            buttons, text="Reject", command=lambda: self.respond(False), bg="red", fg="white", width=6
         )
+        self.reject.pack(side=tk.RIGHT, padx=5)
         buttons.pack(pady=10)
+        self._update_buttons()
+
+    def _update_buttons(self):
+        state = tk.NORMAL if self.list.curselection() else tk.DISABLED
+        self.accept.config(state=state)
+        self.reject.config(state=state)
 
     def is_open(self):
         return bool(self.window.winfo_exists())
@@ -90,10 +99,9 @@ class PendingDialog:
         self.list.delete(0, tk.END)
         for username in users:
             self.list.insert(tk.END, username)
+        self._update_buttons()
 
     def respond(self, accept):
         selection = self.list.curselection()
-        if not selection:
-            messagebox.showerror("Error", "No request selected.", parent=self.window)
-            return
-        self.on_respond(self.list.get(selection[0]), accept)
+        if selection:
+            self.on_respond(self.list.get(selection[0]), accept)

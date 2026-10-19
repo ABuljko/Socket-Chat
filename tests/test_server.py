@@ -90,6 +90,7 @@ def test_friend_request_rules(server):
     a.send("friend_request", username="nobody")
     a.expect("error")
     a.send("respond_request", username="bob", accept=True)
+    assert a.expect("pending")["users"] == []
     a.expect("error")
     b.quiet()
 

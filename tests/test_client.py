@@ -219,11 +219,63 @@ def test_friend_requests(app, connector):
     assert app.view.pending == ["carol", "dave"]
     app.respond_request("carol", True)
     assert conn.sent[-1] == {"type": "respond_request", "username": "carol", "accept": True}
+    conn.receive("friend_added", username="carol")
+    conn.receive("pending", users=["dave"])
+    app.process_events()
     assert app.view.pending == ["dave"]
     conn.receive("friend_added", username="dave")
     app.process_events()
     assert app.view.pending == []
-    assert app.view.members == ["dave"]
+    assert app.view.members == ["carol", "dave"]
+
+
+def test_pending_list_waits_for_the_server(app, connector):
+    conn = log_in(app, connector, friends=())
+    conn.receive("pending", users=["carol", "dave"])
+    app.process_events()
+    app.open_pending()
+    app.respond_request("carol", False)
+    assert app.view.pending == ["carol", "dave"]
+    conn.receive("pending", users=["dave"])
+    conn.receive("error", text="No pending request from carol.")
+    app.process_events()
+    assert app.view.pending == ["dave"]
+
+    conn.drop()
+    app.process_events()
+    app.respond_request("dave", True)
+    assert app.view.errors[-1] == ("Connection Error", "Reconnecting to the server. Try again in a moment.")
+    assert app.view.pending == ["dave"]
+
+
+def answers(conn):
+    return [(m["username"], m["accept"]) for m in conn.sent if m["type"] == "respond_request"]
+
+
+def test_double_click_answers_once(app, connector):
+    conn = log_in(app, connector, friends=())
+    conn.receive("pending", users=["carol", "dave"])
+    app.process_events()
+    app.respond_request("carol", True)
+    app.respond_request("carol", True)
+    app.respond_request("dave", False)
+    assert answers(conn) == [("carol", True), ("dave", False)]
+    conn.receive("friend_added", username="carol")
+    conn.receive("pending", users=["dave"])
+    app.process_events()
+    app.respond_request("dave", False)
+    assert answers(conn) == [("carol", True), ("dave", False)]
+
+    conn.drop()
+    app.process_events()
+    app.view.run_scheduled("start_reconnect")
+    app.process_events()
+    new = connector.connections[-1]
+    new.receive("login_result", ok=True, username="alice", session=SESSION)
+    new.receive("pending", users=["dave"])
+    app.process_events()
+    app.respond_request("dave", False)
+    assert answers(new) == [("dave", False)]
 
 
 def test_guest_commands_need_login(app):
