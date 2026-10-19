@@ -265,7 +265,8 @@ def handle_friend_request(conn, message):
 
 
 def handle_respond_request(conn, message):
-    requester = username_field(message)
+    # Any text, so requests from old-style names can still be answered.
+    requester = text_field(message, "username")
     accept = message.get("accept")
     if not isinstance(accept, bool):
         raise BadRequest("Missing field: accept.")

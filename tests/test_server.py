@@ -1,8 +1,10 @@
 import argparse
 import json
+import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 
 import pytest
 from conftest import REPO
@@ -110,6 +112,17 @@ def test_rejection_is_reported_to_sender(server):
     b.send("respond_request", username="alice", accept=False)
     assert b.expect("pending")["users"] == []
     assert a.expect("request_rejected")["username"] == "bob"
+
+
+def test_request_from_an_old_style_name_can_be_answered(server, tmp_path):
+    a = server().register("alice")
+    with closing(sqlite3.connect(tmp_path / "server.db")) as db, db:
+        db.execute("INSERT INTO users VALUES ('josé@old', 'plaintext')")
+        db.execute("INSERT INTO requests VALUES ('josé@old', 'alice', 'pending')")
+    a.send("pending")
+    assert a.expect("pending")["users"] == ["josé@old"]
+    a.send("respond_request", username="josé@old", accept=False)
+    assert a.expect("pending")["users"] == []
 
 
 def test_only_friends_can_chat(server):
