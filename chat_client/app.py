@@ -345,6 +345,7 @@ class ChatApp:
 
     def on_request_received(self, message):
         username = message["username"]
+        self.answering.discard(username)
         if username not in self.pending:
             self.pending.append(username)
             self.view.set_pending(self.pending)
