@@ -278,6 +278,18 @@ def test_double_click_answers_once(app, connector):
     assert answers(new) == [("dave", False)]
 
 
+def test_request_sent_again_during_answer_can_be_answered(app, connector):
+    conn = log_in(app, connector, friends=())
+    conn.receive("pending", users=["carol"])
+    app.process_events()
+    app.respond_request("carol", False)
+    conn.receive("request_received", username="carol")
+    conn.receive("pending", users=["carol"])
+    app.process_events()
+    app.respond_request("carol", True)
+    assert answers(conn) == [("carol", False), ("carol", True)]
+
+
 def test_guest_commands_need_login(app):
     app.find_user()
     app.open_pending()
